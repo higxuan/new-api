@@ -22,15 +22,30 @@ func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) Po
 	if err == nil {
 		return PolicyDecision{Action: "stop", Reason: "request_completed", Source: "system"}
 	}
+	if GetChannelConstraints(c).SuppressesRetry() {
+		return PolicyDecision{Action: "stop", Reason: "pinned_channel", Source: "channel_constraint"}
+	}
+	if c.GetInt("channel_type") == constant.ChannelTypeCodex && IsUpstreamModelOverload(err) {
+		if c.Request != nil && c.Request.Context().Err() != nil {
+			return PolicyDecision{Action: "stop", Reason: "request_cancelled", Source: "system"}
+		}
+		if c.Writer != nil && c.Writer.Written() {
+			return PolicyDecision{Action: "stop", Reason: "response_started", Source: "system"}
+		}
+		if types.IsSkipRetryError(err) {
+			return PolicyDecision{Action: "stop", Reason: "non_retryable_error", Source: "system"}
+		}
+		if retryTimes > 0 {
+			return PolicyDecision{Action: "retry", Reason: "model_overload_failover", Source: "channel_cooldown"}
+		}
+		return PolicyDecision{Action: "stop", Reason: "attempt_budget_exhausted", Source: "channel_cooldown"}
+	}
 	if ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		source := RequestPolicy(c).SessionModeSource
 		if source == "" {
 			source = "session_rule"
 		}
 		return PolicyDecision{Action: "stop", Reason: "strict_session", Source: source}
-	}
-	if GetChannelConstraints(c).SuppressesRetry() {
-		return PolicyDecision{Action: "stop", Reason: "pinned_channel", Source: "channel_constraint"}
 	}
 	if types.IsChannelError(err) {
 		return PolicyDecision{Action: "retry", Reason: "channel_error", Source: "system"}

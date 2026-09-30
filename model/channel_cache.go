@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -114,11 +115,48 @@ func SyncChannelCache(frequency int) {
 	}
 }
 
+type ChannelSelectionOptions struct {
+	ExcludedChannelIDs map[int]struct{}
+	PrimaryTypes       []int
+	FallbackTypes      []int
+}
+
+// GetCandidateChannelIDs returns the currently cached candidates after the
+// request filters. It is used by routing policies that need to inspect shared
+// provider state before invoking the normal weighted selector.
+func GetCandidateChannelIDs(group string, modelName string, filters []dto.ChannelFilter) []int {
+	if !common.MemoryCacheEnabled {
+		return nil
+	}
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+	ids, _ := filterCandidateIDs(group2model2channels[group][modelName], modelName, filters)
+	if len(ids) == 0 {
+		normalizedModel := ratio_setting.RoutingMatchModelName(modelName)
+		ids, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], modelName, filters)
+	}
+	return append([]int(nil), ids...)
+}
+
 func GetRandomSatisfiedChannel(
 	group string,
 	model string,
 	retry int,
 	filters []dto.ChannelFilter,
+) (*Channel, error) {
+	return GetRandomSatisfiedChannelWithOptions(group, model, retry, filters, ChannelSelectionOptions{})
+}
+
+// GetRandomSatisfiedChannelWithOptions applies request-local exclusions and an
+// optional primary/fallback channel-type policy before the normal priority and
+// weight selection. If a primary type exists for the model, fallback types are
+// considered only after every healthy primary candidate has been excluded.
+func GetRandomSatisfiedChannelWithOptions(
+	group string,
+	model string,
+	retry int,
+	filters []dto.ChannelFilter,
+	options ChannelSelectionOptions,
 ) (*Channel, error) {
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
@@ -136,6 +174,7 @@ func GetRandomSatisfiedChannel(
 		normalizedModel := ratio_setting.RoutingMatchModelName(model)
 		channels, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
 	}
+	channels = selectChannelCandidates(channels, options)
 
 	if len(channels) == 0 {
 		return nil, nil
@@ -214,6 +253,49 @@ func GetRandomSatisfiedChannel(
 	}
 	// return null if no channel is not found
 	return nil, errors.New("channel not found")
+}
+
+func selectChannelCandidates(channelIDs []int, options ChannelSelectionOptions) []int {
+	if len(channelIDs) == 0 {
+		return nil
+	}
+	withoutExcluded := make([]int, 0, len(channelIDs))
+	for _, id := range channelIDs {
+		if _, excluded := options.ExcludedChannelIDs[id]; !excluded {
+			withoutExcluded = append(withoutExcluded, id)
+		}
+	}
+	if len(options.PrimaryTypes) == 0 {
+		return withoutExcluded
+	}
+
+	primary := make([]int, 0, len(withoutExcluded))
+	primaryExists := false
+	for _, id := range channelIDs {
+		channel, ok := channelsIDM[id]
+		if !ok || !slices.Contains(options.PrimaryTypes, channel.Type) {
+			continue
+		}
+		primaryExists = true
+		if _, excluded := options.ExcludedChannelIDs[id]; !excluded {
+			primary = append(primary, id)
+		}
+	}
+	if len(primary) > 0 {
+		return primary
+	}
+	if !primaryExists || len(options.FallbackTypes) == 0 {
+		return withoutExcluded
+	}
+
+	fallback := make([]int, 0, len(withoutExcluded))
+	for _, id := range withoutExcluded {
+		channel, ok := channelsIDM[id]
+		if ok && slices.Contains(options.FallbackTypes, channel.Type) {
+			fallback = append(fallback, id)
+		}
+	}
+	return fallback
 }
 
 func CacheGetChannel(id int) (*Channel, error) {

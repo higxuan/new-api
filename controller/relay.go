@@ -196,6 +196,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		if newAPIError == nil {
+			if channel.Type == constant.ChannelTypeCodex && service.IsAbnormalCodexStream(relayInfo.StreamStatus) {
+				service.HandleAbnormalCodexStream(c, relayInfo.StreamStatus, channel.Id, relayInfo.OriginModelName)
+			}
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
 			relayInfo.LastError = nil
 			return
@@ -203,6 +206,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
+		if !c.Writer.Written() && channel.Type == constant.ChannelTypeCodex {
+			service.HandleUpstreamModelOverload(c, retryParam, channel.Id, relayInfo.OriginModelName, newAPIError)
+		}
 
 		decision := service.DecideRelayRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)
@@ -557,6 +563,9 @@ func executeTaskSubmissionWith(
 
 		taskAPIError := taskSubmissionAPIError(taskErr)
 		relayInfo.LastError = taskAPIError
+		if channel.Type == constant.ChannelTypeCodex {
+			service.HandleUpstreamModelOverload(c, retryParam, channel.Id, relayInfo.OriginModelName, taskAPIError)
+		}
 		decision := decideTaskRetry(c, taskErr, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, taskAPIError, decision)
 		if !taskErr.LocalError {

@@ -316,6 +316,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				apiErr = service.NormalizeViolationFeeError(types.NewError(dialErr, types.ErrorCodeDoRequestFailed))
 				service.ResetStatusCode(apiErr, c.GetString("status_code_mapping"))
 				info.LastError = apiErr
+				if channel.Type == appconstant.ChannelTypeCodex {
+					service.HandleUpstreamModelOverload(c, retry, channel.Id, modelName, apiErr)
+				}
 				decision := service.DecideRelayRetry(c, apiErr, common.RetryTimes-retry.GetRetry())
 				service.RecordPolicyFailure(c, channel.Id, apiErr, decision)
 				service.ProcessChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, info.ApiKey, channel.GetAutoBan()), apiErr, info)
@@ -445,7 +448,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				if strings.HasPrefix(event.Type, "response.") {
 					if !accepted {
 						// Like HTTP, bind the session only once upstream accepted the request.
-						service.RecordChannelAffinity(c, s.lockedChannelID)
+						if !service.IsCodexOverflowFallback(c) {
+							service.RecordChannelAffinity(c, s.lockedChannelID)
+						}
 					}
 					accepted = true
 					if event.Response != nil && event.Response.ID != "" {

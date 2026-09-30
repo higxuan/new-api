@@ -42,12 +42,13 @@ func AppendTaskPluginIdentityFilter(c *gin.Context, pluginKey string) {
 }
 
 type RetryParam struct {
-	Ctx          *gin.Context
-	TokenGroup   string
-	ModelName    string
-	RequestPath  string
-	Retry        *int
-	resetNextTry bool
+	Ctx                *gin.Context
+	TokenGroup         string
+	ModelName          string
+	RequestPath        string
+	Retry              *int
+	ExcludedChannelIDs map[int]struct{}
+	resetNextTry       bool
 }
 
 func (p *RetryParam) GetRetry() int {
@@ -74,6 +75,16 @@ func (p *RetryParam) IncreaseRetry() {
 
 func (p *RetryParam) ResetRetryNextTry() {
 	p.resetNextTry = true
+}
+
+func (p *RetryParam) ExcludeChannel(channelID int) {
+	if p == nil || channelID <= 0 {
+		return
+	}
+	if p.ExcludedChannelIDs == nil {
+		p.ExcludedChannelIDs = make(map[int]struct{})
+	}
+	p.ExcludedChannelIDs[channelID] = struct{}{}
 }
 
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.
@@ -147,11 +158,12 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			}
 			logger.LogDebug(param.Ctx, "Auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
-			channel, _ = model.GetRandomSatisfiedChannel(
+			channel, _ = model.GetRandomSatisfiedChannelWithOptions(
 				autoGroup,
 				param.ModelName,
 				priorityRetry,
 				filters,
+				codexFailoverSelectionOptions(param, autoGroup, filters),
 			)
 			if channel == nil {
 				// Current group has no available channel for this model, try next group
@@ -190,17 +202,49 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			break
 		}
 	} else {
-		channel, err = model.GetRandomSatisfiedChannel(
+		channel, err = model.GetRandomSatisfiedChannelWithOptions(
 			param.TokenGroup,
 			param.ModelName,
 			param.GetRetry(),
 			filters,
+			codexFailoverSelectionOptions(param, param.TokenGroup, filters),
 		)
 		if err != nil {
 			return nil, param.TokenGroup, err
 		}
 	}
 	return channel, selectGroup, nil
+}
+
+func codexFailoverSelectionOptions(param *RetryParam, group string, filters []dto.ChannelFilter) model.ChannelSelectionOptions {
+	excluded := make(map[int]struct{}, len(param.ExcludedChannelIDs))
+	for channelID := range param.ExcludedChannelIDs {
+		excluded[channelID] = struct{}{}
+	}
+	primaryExists := false
+	healthyPrimaryExists := false
+	for _, channelID := range model.GetCandidateChannelIDs(group, param.ModelName, filters) {
+		channel, err := model.CacheGetChannel(channelID)
+		if err != nil || channel.Type != constant.ChannelTypeCodex {
+			continue
+		}
+		primaryExists = true
+		if _, requestExcluded := excluded[channelID]; requestExcluded || IsChannelModelCoolingDown(channelID, param.ModelName) {
+			excluded[channelID] = struct{}{}
+			continue
+		}
+		healthyPrimaryExists = true
+	}
+	if param.Ctx != nil && primaryExists && !healthyPrimaryExists {
+		param.Ctx.Set(codexOverflowFallbackContextKey, true)
+	} else if param.Ctx != nil && healthyPrimaryExists {
+		param.Ctx.Set(codexOverflowFallbackContextKey, false)
+	}
+	return model.ChannelSelectionOptions{
+		ExcludedChannelIDs: excluded,
+		PrimaryTypes:       []int{constant.ChannelTypeCodex},
+		FallbackTypes:      []int{constant.ChannelTypeOpenAI},
+	}
 }
 
 func pinnedTaskPluginIdentities(c *gin.Context, expected string) ([]int, []string) {
@@ -315,10 +359,18 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			preferred, err := model.CacheGetChannel(preferredChannelID)
 			affinitySatisfied := false
 			if err == nil && preferred != nil && preferred.Status == common.ChannelStatusEnabled {
-				affinitySatisfied, _ = model.ChannelSatisfiesFilters(preferred, modelName, constraints.Filters)
+				if IsChannelModelCoolingDown(preferred.Id, modelName) {
+					ClearCurrentChannelAffinityCache(c)
+					preferred = nil
+				} else {
+					affinitySatisfied, _ = model.ChannelSatisfiesFilters(preferred, modelName, constraints.Filters)
+				}
 			}
 			if affinitySatisfied {
-				if usingGroup == "auto" {
+				if RequestPolicy(c).SessionMode != "strict" && ShouldRebalanceChannelAffinity(usingGroup, modelName, preferred.Id, constraints.Filters) {
+					ClearCurrentChannelAffinityCache(c)
+					retry.ExcludeChannel(preferred.Id)
+				} else if usingGroup == "auto" {
 					userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 					for _, g := range GetRequestAutoGroups(c, userGroup) {
 						if model.IsChannelEnabledForGroupModel(g, modelName, preferred.Id) {
@@ -340,7 +392,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			if !affinityUsable && !ShouldKeepChannelAffinityOnChannelDisabled() {
 				ClearCurrentChannelAffinityCache(c)
 			}
-			if !affinityUsable && RequestPolicy(c).SessionMode == "strict" {
+			if !affinityUsable && RequestPolicy(c).SessionMode == "strict" && !IsChannelModelCoolingDown(preferredChannelID, modelName) {
 				return nil, "", &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Message: "strict_session_binding_unavailable"}
 			}
 		}
@@ -373,6 +425,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			FilterKind: kind, Channel: channel, NoAvailableChannel: true,
 		}
 	}
+	recordSelectedChannelBalance(selectGroup, modelName, channel)
 	return channel, selectGroup, nil
 }
 
