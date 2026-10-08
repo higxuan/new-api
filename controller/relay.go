@@ -154,6 +154,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	var codexAttempt *service.CodexChannelAttempt
+	defer func() { codexAttempt.Close() }()
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.StreamStatus = nil
@@ -184,6 +186,21 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
+		if channel.Type == constant.ChannelTypeCodex {
+			var admitted bool
+			codexAttempt, admitted = service.BeginCodexChannelAttempt(c, channel.Id)
+			if !admitted {
+				if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned {
+					newAPIError = types.NewErrorWithStatusCode(errors.New("upstream channel is recovering or cooling down"), types.ErrorCodeGetChannelFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+					break
+				}
+				retryParam.ExcludeChannel(channel.Id)
+				service.ClearCurrentChannelAffinityCache(c)
+				retryParam.ResetRetryNextTry()
+				continue
+			}
+		}
+
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
 			newAPIError = relay.WssHelper(c, relayInfo)
@@ -195,10 +212,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = relayHandler(c, relayInfo)
 		}
 
+		codexAttempt.Finish(relayInfo.StreamStatus, newAPIError)
+		codexAttempt = nil
+
 		if newAPIError == nil {
-			if channel.Type == constant.ChannelTypeCodex {
-				service.RecordCodexStreamHealth(channel.Id, relayInfo.StreamStatus)
-			}
 			if channel.Type == constant.ChannelTypeCodex && service.IsAbnormalCodexStream(relayInfo.StreamStatus) {
 				service.HandleAbnormalCodexStream(c, relayInfo.StreamStatus, channel.Id, relayInfo.OriginModelName)
 			}
@@ -269,7 +286,8 @@ var upgrader = websocket.Upgrader{
 }
 
 func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
-	if info.ChannelMeta == nil {
+	_, excluded := retryParam.ExcludedChannelIDs[c.GetInt("channel_id")]
+	if info.ChannelMeta == nil && !excluded {
 		autoBan := c.GetBool("auto_ban")
 		autoBanInt := 1
 		if !autoBan {

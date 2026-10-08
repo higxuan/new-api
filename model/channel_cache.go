@@ -119,6 +119,7 @@ type ChannelSelectionOptions struct {
 	ExcludedChannelIDs map[int]struct{}
 	PrimaryTypes       []int
 	FallbackTypes      []int
+	ShareFallback      bool
 }
 
 // GetCandidateChannelIDs returns the currently cached candidates after the
@@ -136,6 +137,31 @@ func GetCandidateChannelIDs(group string, modelName string, filters []dto.Channe
 		ids, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], modelName, filters)
 	}
 	return append([]int(nil), ids...)
+}
+
+// GetConfiguredCodexChannelIDs includes disabled accounts for health tracking,
+// but never adds them to the enabled routing candidates.
+func GetConfiguredCodexChannelIDs(group, modelName string, filters []dto.ChannelFilter) []int {
+	if !common.MemoryCacheEnabled {
+		return nil
+	}
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+	normalized := ratio_setting.RoutingMatchModelName(modelName)
+	var ids []int
+	for id, channel := range channelsIDM {
+		if channel.Type != constant.ChannelTypeCodex || !slices.Contains(strings.Split(channel.Group, ","), group) {
+			continue
+		}
+		models := channel.GetModels()
+		if !slices.Contains(models, modelName) && !slices.Contains(models, normalized) {
+			continue
+		}
+		if ok, _ := ChannelSatisfiesFilters(channel, modelName, filters); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func GetRandomSatisfiedChannel(
@@ -282,6 +308,13 @@ func selectChannelCandidates(channelIDs []int, options ChannelSelectionOptions) 
 		}
 	}
 	if len(primary) > 0 {
+		if options.ShareFallback {
+			for _, id := range withoutExcluded {
+				if channel, ok := channelsIDM[id]; ok && slices.Contains(options.FallbackTypes, channel.Type) {
+					primary = append(primary, id)
+				}
+			}
+		}
 		return primary
 	}
 	if !primaryExists || len(options.FallbackTypes) == 0 {

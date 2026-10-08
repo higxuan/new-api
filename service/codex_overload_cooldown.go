@@ -29,8 +29,8 @@ func IsChannelModelCoolingDown(channelID int, modelName string) bool {
 	if channelID <= 0 || strings.TrimSpace(modelName) == "" || !common.RedisEnabled || common.RDB == nil {
 		return false
 	}
-	_, cooldown := codexChannelHealthKeys(channelID)
-	return common.RDB.Exists(context.Background(), cooldown, codexOverloadKey(channelID, modelName)).Val() > 0
+	keys := codexChannelCircuitKeys(channelID)
+	return common.RDB.Exists(context.Background(), keys[1], keys[3], keys[5], codexOverloadKey(channelID, modelName)).Val() > 0
 }
 
 func MarkChannelModelOverload(channelID int, modelName string) error {
@@ -78,6 +78,9 @@ func IsUpstreamModelOverload(err *types.NewAPIError) bool {
 func HandleUpstreamModelOverload(c *gin.Context, retry *RetryParam, channelID int, modelName string, err *types.NewAPIError) bool {
 	if !IsUpstreamModelOverload(err) {
 		return false
+	}
+	if common.RedisEnabled && common.RDB != nil {
+		recordCodexChannelResult(common.RDB, channelID, codexChannelCircuitKeys(channelID), "", "", 0, 3)
 	}
 	if markErr := MarkChannelModelOverload(channelID, modelName); markErr != nil {
 		common.SysError(fmt.Sprintf("mark codex overload cooldown failed: channel=%d, err=%v", channelID, markErr))

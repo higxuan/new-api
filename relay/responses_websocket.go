@@ -229,6 +229,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	modelName := create.Request.Model
 	started := time.Now()
 	var info *relaycommon.RelayInfo
+	var codexAttempt *service.CodexChannelAttempt
 	billingPrepared := false
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -240,11 +241,12 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		}
 		perfmetrics.RecordRelayResult(c.Request.Context(), info, apiErr)
 		if info != nil && info.GetChannelType() == appconstant.ChannelTypeCodex {
-			service.RecordCodexStreamHealth(info.GetChannelID(), info.StreamStatus)
+			codexAttempt.Finish(info.StreamStatus, apiErr)
 			if service.IsChannelModelCoolingDown(info.GetChannelID(), modelName) {
 				state.closeAfter = true
 			}
 		}
+		codexAttempt.Close()
 		// Settlement already marks the request policy successful, and nothing
 		// reads a termination decision after this point on the WebSocket path,
 		// so neither policy record belongs here.
@@ -273,6 +275,12 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		if apiErr = s.restoreConnectionContext(c, modelName); apiErr != nil {
 			return apiErr
 		}
+		if common.GetContextKeyInt(c, appconstant.ContextKeyChannelType) == appconstant.ChannelTypeOpenAI && !service.CodexProtectionActive(s.lockedGroup, modelName, service.GetChannelConstraints(c).Filters) {
+			if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); !pinned && service.ShouldRebalanceChannelAffinity(s.lockedGroup, modelName, s.lockedChannelID, service.GetChannelConstraints(c).Filters) {
+				state.closeAfter = true
+				return types.NewErrorWithStatusCode(errors.New("Codex channels recovered; reconnect required"), types.ErrorCodeBadResponse, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+			}
+		}
 		info = relaycommon.GenRelayInfoResponses(c, &create.Request)
 		info.IsStream = true
 		common.SetContextKey(c, appconstant.ContextKeyIsStream, true)
@@ -284,6 +292,14 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		payload, apiErr = buildResponsesWSCreatePayload(c, info, create.Request, create.Generate, create.StreamID)
 		if apiErr != nil {
 			return apiErr
+		}
+		if info.GetChannelType() == appconstant.ChannelTypeCodex {
+			var admitted bool
+			codexAttempt, admitted = service.BeginCodexChannelAttempt(c, info.GetChannelID())
+			if !admitted {
+				state.closeAfter = true
+				return types.NewErrorWithStatusCode(errors.New("upstream channel is recovering or cooling down; reconnect required"), types.ErrorCodeBadResponse, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+			}
 		}
 		if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
 			state.closeAfter = true
@@ -321,11 +337,26 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			}
 			adaptor := GetAdaptor(info.ApiType)
 			adaptor.Init(info)
+			if channel.Type == appconstant.ChannelTypeCodex {
+				var admitted bool
+				codexAttempt, admitted = service.BeginCodexChannelAttempt(c, channel.Id)
+				if !admitted {
+					if _, pinned, _ := service.GetChannelConstraints(c).ResolvedPin(); pinned {
+						return types.NewErrorWithStatusCode(errors.New("upstream channel is recovering or cooling down"), types.ErrorCodeGetChannelFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+					}
+					retry.ExcludeChannel(channel.Id)
+					service.ClearCurrentChannelAffinityCache(c)
+					retry.ResetRetryNextTry()
+					continue
+				}
+			}
 			target, dialErr := relaychannel.DoWssRequest(adaptor, c, info, nil)
 			if dialErr != nil {
 				apiErr = service.NormalizeViolationFeeError(types.NewError(dialErr, types.ErrorCodeDoRequestFailed))
 				service.ResetStatusCode(apiErr, c.GetString("status_code_mapping"))
 				info.LastError = apiErr
+				codexAttempt.Finish(nil, apiErr)
+				codexAttempt = nil
 				if channel.Type == appconstant.ChannelTypeCodex {
 					service.HandleUpstreamModelOverload(c, retry, channel.Id, modelName, apiErr)
 				}
@@ -506,6 +537,11 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			sentControl = control.body
 		case <-idle.C:
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, context.DeadlineExceeded)
+			state.closeAfter = true
+			ConsumeResponsesQuota(c, info, accumulator.Finish())
+			return nil
+		case <-c.Request.Context().Done():
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
 			state.closeAfter = true
 			ConsumeResponsesQuota(c, info, accumulator.Finish())
 			return nil

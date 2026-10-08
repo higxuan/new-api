@@ -213,6 +213,9 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			return nil, param.TokenGroup, err
 		}
 	}
+	if channel != nil && param.Ctx != nil && channel.Type == constant.ChannelTypeOpenAI && CodexProtectionActive(selectGroup, param.ModelName, filters) {
+		param.Ctx.Set(codexOverflowFallbackContextKey, true)
+	}
 	return channel, selectGroup, nil
 }
 
@@ -244,6 +247,7 @@ func codexFailoverSelectionOptions(param *RetryParam, group string, filters []dt
 		ExcludedChannelIDs: excluded,
 		PrimaryTypes:       []int{constant.ChannelTypeCodex},
 		FallbackTypes:      []int{constant.ChannelTypeOpenAI},
+		ShareFallback:      CodexProtectionActive(group, param.ModelName, filters),
 	}
 }
 
@@ -367,7 +371,8 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				}
 			}
 			if affinitySatisfied {
-				if RequestPolicy(c).SessionMode != "strict" && ShouldRebalanceChannelAffinity(usingGroup, modelName, preferred.Id, constraints.Filters) {
+				openAIProtectionEnded := preferred.Type == constant.ChannelTypeOpenAI && !CodexProtectionActive(usingGroup, modelName, constraints.Filters)
+				if (RequestPolicy(c).SessionMode != "strict" || openAIProtectionEnded) && ShouldRebalanceChannelAffinity(usingGroup, modelName, preferred.Id, constraints.Filters) && (openAIProtectionEnded || channelAffinityHoldElapsed(c, preferred.Id)) {
 					ClearCurrentChannelAffinityCache(c)
 					retry.ExcludeChannel(preferred.Id)
 				} else if usingGroup == "auto" {
@@ -426,6 +431,9 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 		}
 	}
 	recordSelectedChannelBalance(selectGroup, modelName, channel)
+	if channel.Type == constant.ChannelTypeOpenAI && CodexProtectionActive(selectGroup, modelName, constraints.Filters) {
+		c.Set(codexOverflowFallbackContextKey, true)
+	}
 	return channel, selectGroup, nil
 }
 

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"hash/fnv"
 	"maps"
@@ -664,6 +665,11 @@ func ClearCurrentChannelAffinityCache(c *gin.Context) bool {
 		return false
 	}
 	c.Set(ginKeyChannelAffinitySkipRetry, false)
+	if common.RedisEnabled && common.RDB != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = common.RDB.Del(ctx, channelAffinityHoldKey(cacheKey)).Err()
+		cancel()
+	}
 	for _, ok := range deleted {
 		if ok {
 			return true
@@ -753,7 +759,9 @@ func RecordChannelAffinity(c *gin.Context, channelID int) {
 	cache := getChannelAffinityCache()
 	if err := cache.SetWithTTL(cacheKey, channelID, time.Duration(ttlSeconds)*time.Second); err != nil {
 		common.SysError(fmt.Sprintf("channel affinity cache set failed: key=%s, err=%v", cacheKey, err))
+		return
 	}
+	channelAffinityHoldElapsed(c, channelID)
 }
 
 type ChannelAffinityUsageCacheStats struct {

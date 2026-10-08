@@ -119,6 +119,6 @@ func TestChannelBalanceCountersExpireAndRemainPerChannel(t *testing.T) {
 	counts := channelBalanceCounts("default", "gpt-6-sol", []*model.Channel{{Id: 1}, {Id: 2}})
 	assert.Equal(t, int64(2), counts[1])
 	assert.Equal(t, int64(1), counts[2])
-	server.FastForward(channelBalanceWindow)
+	server.FastForward(channelBalanceRetention)
 	assert.Empty(t, channelBalanceCounts("default", "gpt-6-sol", []*model.Channel{{Id: 1}, {Id: 2}}))
 }
