@@ -225,6 +225,15 @@ func (s *StreamStatus) Summary() string {
 		fmt.Fprintf(b, " end_error=%q", s.EndError.Error())
 	}
 	s.mu.Lock()
+	if s.response != "" {
+		fmt.Fprintf(b, " response_status=%s", s.response)
+	}
+	if s.errorCode != "" {
+		fmt.Fprintf(b, " error_code=%q", s.errorCode)
+	}
+	if s.errorType != "" {
+		fmt.Fprintf(b, " error_type=%q", s.errorType)
+	}
 	if s.ErrorCount > 0 {
 		fmt.Fprintf(b, " soft_errors=%d", s.ErrorCount)
 	}

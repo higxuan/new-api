@@ -307,7 +307,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	cleanup()
-	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
+	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() && !info.StreamStatus.ResponseFailed() {
 		logger.LogInfo(c, fmt.Sprintf("stream ended: %s", info.StreamStatus.Summary()))
 	} else {
 		logger.LogError(c, fmt.Sprintf("stream ended: %s, received=%d", info.StreamStatus.Summary(), info.ReceivedResponseCount))

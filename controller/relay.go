@@ -196,6 +196,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		if newAPIError == nil {
+			if channel.Type == constant.ChannelTypeCodex {
+				service.RecordCodexStreamHealth(channel.Id, relayInfo.StreamStatus)
+			}
 			if channel.Type == constant.ChannelTypeCodex && service.IsAbnormalCodexStream(relayInfo.StreamStatus) {
 				service.HandleAbnormalCodexStream(c, relayInfo.StreamStatus, channel.Id, relayInfo.OriginModelName)
 			}

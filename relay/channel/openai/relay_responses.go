@@ -93,6 +93,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 		sendResponsesStreamData(c, streamResponse, data)
 		accumulator.Observe(&streamResponse)
+		service.ObserveResponsesErrorPayload(info, data)
 	})
 
 	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)

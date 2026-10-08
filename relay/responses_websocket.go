@@ -239,6 +239,12 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			info = &relaycommon.RelayInfo{OriginModelName: modelName, UsingGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), StartTime: started}
 		}
 		perfmetrics.RecordRelayResult(c.Request.Context(), info, apiErr)
+		if info != nil && info.GetChannelType() == appconstant.ChannelTypeCodex {
+			service.RecordCodexStreamHealth(info.GetChannelID(), info.StreamStatus)
+			if service.IsChannelModelCoolingDown(info.GetChannelID(), modelName) {
+				state.closeAfter = true
+			}
+		}
 		// Settlement already marks the request policy successful, and nothing
 		// reads a termination decision after this point on the WebSocket path,
 		// so neither policy record belongs here.
@@ -260,6 +266,10 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	service.GetChannelConstraints(c).AddFilter(appdto.ChannelFilter{Kind: appdto.FilterRequestPath, RequestPath: c.Request.URL.Path})
 
 	if s.lockedChannelID != 0 {
+		if service.IsChannelModelCoolingDown(s.lockedChannelID, modelName) {
+			state.closeAfter = true
+			return types.NewErrorWithStatusCode(errors.New("upstream channel is cooling down; reconnect required"), types.ErrorCodeBadResponse, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+		}
 		if apiErr = s.restoreConnectionContext(c, modelName); apiErr != nil {
 			return apiErr
 		}
@@ -428,6 +438,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 							info.StreamStatus.MarkFailed(code, rejection.Error.Type, rejection.Status)
 						}
 						accumulator.Observe(&event.ResponsesStreamResponse)
+						service.ObserveResponsesErrorPayload(info, string(incoming.body))
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 						s.lastResponseID = responseID
 						state.terminal, state.closeAfter = &incoming, ambiguous
@@ -458,6 +469,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					}
 				}
 				accumulator.Observe(&event.ResponsesStreamResponse)
+				service.ObserveResponsesErrorPayload(info, string(incoming.body))
 			}
 			switch event.Type {
 			case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":

@@ -8,6 +8,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/tidwall/gjson"
 )
 
 // ResponsesUsageAccumulator owns the accounting facts for one Responses stream.
@@ -132,7 +133,7 @@ func ObserveResponsesOutcome(info *relaycommon.RelayInfo, event *dto.ResponsesSt
 				errorType = oaiErr.Type
 			}
 		}
-		info.StreamStatus.MarkFailed(code, errorType, 0)
+		info.StreamStatus.MarkFailed(responsesErrorLabel(code), responsesErrorLabel(errorType), 0)
 	case event.Type == "response.incomplete" || responseStatus == "incomplete":
 		reason := ""
 		if event.Response != nil && event.Response.IncompleteDetails != nil {
@@ -144,6 +145,51 @@ func ObserveResponsesOutcome(info *relaycommon.RelayInfo, event *dto.ResponsesSt
 	case event.Type == "response.completed" || event.Type == "response.done" || responseStatus == "completed":
 		info.StreamStatus.MarkCompleted()
 	}
+}
+
+// ObserveResponsesErrorPayload handles nested error envelopes absent from the
+// typed event DTO. Only bounded labels/status are retained, never messages.
+func ObserveResponsesErrorPayload(info *relaycommon.RelayInfo, data string) {
+	if info == nil || info.StreamStatus == nil || !info.StreamStatus.ResponseFailed() {
+		return
+	}
+	code, errorType, status := "", "", 0
+	for _, path := range []string{"response.error", "error", ""} {
+		payload := gjson.Parse(data)
+		if path != "" {
+			payload = payload.Get(path)
+		}
+		if code == "" {
+			code = responsesErrorLabel(payload.Get("code").String())
+		}
+		if errorType == "" {
+			errorType = responsesErrorLabel(payload.Get("type").String())
+		}
+		if status == 0 {
+			value := payload.Get("status").Int()
+			if value >= 400 && value <= 599 {
+				status = int(value)
+			}
+		}
+	}
+	// The top-level type is an event name, not an upstream error type.
+	if errorType == "error" || strings.HasPrefix(errorType, "response.") {
+		errorType = ""
+	}
+	info.StreamStatus.MarkFailed(code, errorType, status)
+}
+
+func responsesErrorLabel(value string) string {
+	if len(value) > 128 {
+		return ""
+	}
+	for _, c := range value {
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' || c == '.' {
+			continue
+		}
+		return ""
+	}
+	return value
 }
 
 func ApplyResponsesUsage(dst *dto.Usage, src *dto.Usage) {

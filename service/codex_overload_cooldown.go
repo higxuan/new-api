@@ -29,7 +29,8 @@ func IsChannelModelCoolingDown(channelID int, modelName string) bool {
 	if channelID <= 0 || strings.TrimSpace(modelName) == "" || !common.RedisEnabled || common.RDB == nil {
 		return false
 	}
-	return common.RDB.Exists(context.Background(), codexOverloadKey(channelID, modelName)).Val() > 0
+	_, cooldown := codexChannelHealthKeys(channelID)
+	return common.RDB.Exists(context.Background(), cooldown, codexOverloadKey(channelID, modelName)).Val() > 0
 }
 
 func MarkChannelModelOverload(channelID int, modelName string) error {
